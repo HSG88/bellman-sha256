@@ -1,4 +1,4 @@
-use bellman::{
+use bellperson::{
     gadgets::{
         boolean::{AllocatedBit, Boolean},
         multipack,
@@ -6,8 +6,9 @@ use bellman::{
     },
     groth16, Circuit, ConstraintSystem, SynthesisError,
 };
-use bls12_381::Bls12;
+use blstrs::{Bls12, Scalar};
 use ff::PrimeField;
+use pairing::Engine;
 use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 
@@ -24,7 +25,8 @@ fn sha256d<Scalar: PrimeField, CS: ConstraintSystem<Scalar>>(
         .cloned()
         .collect();
 
-    let res = sha256(cs.namespace(|| "SHA-256(input)"), &input)?;
+    let mid = sha256(cs.namespace(|| "SHA-256(input)"), &input)?;
+    let res = sha256(cs.namespace(|| "SHA-256(mid)"), &mid)?;
 
     // Flip endianness of each output byte
     Ok(res
@@ -38,7 +40,7 @@ fn sha256d<Scalar: PrimeField, CS: ConstraintSystem<Scalar>>(
 struct MyCircuit {
     /// The input to SHA-256d we are proving that we know. Set to `None` when we
     /// are verifying a proof (and do not have the witness data).
-    preimage: Option<[u8; 32]>,
+    preimage: Option<[u8; 80]>,
 }
 
 impl<Scalar: PrimeField> Circuit<Scalar> for MyCircuit {
@@ -48,24 +50,22 @@ impl<Scalar: PrimeField> Circuit<Scalar> for MyCircuit {
         // Vec of None (indicating that the value of each bit is unknown).
         let bit_values = if let Some(preimage) = self.preimage {
             preimage
-                .into_iter()
+                .iter()
                 .map(|byte| (0..8).map(move |i| (byte >> i) & 1u8 == 1u8))
                 .flatten()
                 .map(|b| Some(b))
                 .collect()
         } else {
-            vec![None; 32 * 8]
+            vec![None; 80 * 8]
         };
-        assert_eq!(bit_values.len(), 32 * 8);
+        assert_eq!(bit_values.len(), 80 * 8);
 
         // Witness the bits of the preimage.
         let preimage_bits = bit_values
             .into_iter()
             .enumerate()
             // Allocate each bit.
-            .map(|(i, b)| {
-                AllocatedBit::alloc(cs.namespace(|| format!("preimage bit {}", i)), b)
-            })
+            .map(|(i, b)| AllocatedBit::alloc(cs.namespace(|| format!("preimage bit {}", i)), b))
             // Convert the AllocatedBits into Booleans (required for the sha256 gadget).
             .map(|b| b.map(Boolean::from))
             .collect::<Result<Vec<_>, _>>()?;
@@ -79,32 +79,34 @@ impl<Scalar: PrimeField> Circuit<Scalar> for MyCircuit {
 }
 
 fn main() {
-// Create parameters for our circuit. In a production deployment these would
-// be generated securely using a multiparty computation.
-let params = {
-    let c = MyCircuit { preimage: None };
-    groth16::generate_random_parameters::<Bls12, _, _>(c, &mut OsRng).unwrap()
-};
+    std::env::set_var("BELLMAN_NO_GPU", "1");
 
-// Prepare the verification key (for proof verification).
-let pvk = groth16::prepare_verifying_key(&params.vk);
+    // Create parameters for our circuit. In a production deployment these would
+    // be generated securely using a multiparty computation.
+    let params = {
+        let c = MyCircuit { preimage: None };
+        groth16::generate_random_parameters::<Bls12, _, _>(c, &mut OsRng).unwrap()
+    };
 
-// Pick a preimage and compute its hash.
-let preimage = [41; 32];
-let hash = Sha256::digest(&preimage);
+    // Prepare the verification key (for proof verification).
+    let pvk = groth16::prepare_verifying_key(&params.vk);
 
-// Create an instance of our circuit (with the preimage as a witness).
-let c = MyCircuit {
-    preimage: Some(preimage),
-};
+    // Pick a preimage and compute its hash.
+    let preimage = [42; 80];
+    let hash = Sha256::digest(&Sha256::digest(&preimage));
 
-// Create a Groth16 proof with our parameters.
-let proof = groth16::create_random_proof(c, &params, &mut OsRng).unwrap();
+    // Create an instance of our circuit (with the preimage as a witness).
+    let c = MyCircuit {
+        preimage: Some(preimage),
+    };
 
-// Pack the hash as inputs for proof verification.
-let hash_bits = multipack::bytes_to_bits_le(&hash);
-let inputs = multipack::compute_multipacking(&hash_bits);
+    // Create a Groth16 proof with our parameters.
+    let proof = groth16::create_random_proof(c, &params, &mut OsRng).unwrap();
 
-// Check the proof!
-assert!(groth16::verify_proof(&pvk, &proof, &inputs).is_ok());
+    // Pack the hash as inputs for proof verification.
+    let hash_bits = multipack::bytes_to_bits_le(&hash);
+    let inputs = multipack::compute_multipacking::<<Bls12 as Engine>::Fr>(&hash_bits);
+
+    // Check the proof!
+    assert!(groth16::verify_proof(&pvk, &proof, &inputs).unwrap());
 }
